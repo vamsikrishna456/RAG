@@ -147,10 +147,10 @@ __pycache__/
 
 ### 5. Run the application
 
-If your Streamlit entry point is `main.py`, run:
+If your Streamlit entry point is `app.py`, run:
 
 ```bash
-streamlit run main.py
+streamlit run app.py
 ```
 
 Open the local URL displayed in your terminal to interact with the application.

@@ -1,8 +1,9 @@
-
+import os
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 
+from groq import Groq
 from langchain_text_splitters import CharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -14,16 +15,50 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
 
-def get_pdfs_text(pdf_docs):
+def get_available_groq_models(api_key):
+    default_models = [
+        "openai/gpt-oss-20b",
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.8-27b",
+        "allam-2-7b"
+    ]
+    if not api_key:
+        return default_models
+    try:
+        client = Groq(api_key=api_key)
+        models_data = client.models.list()
+        chat_models = [
+            m.id for m in models_data.data
+            if not any(x in m.id.lower() for x in ["whisper", "guard", "orpheus"])
+        ]
+        return sorted(chat_models) if chat_models else default_models
+    except Exception:
+        return default_models
+
+
+def get_documents_text(docs):
     text = ""
-
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-
-        for page in pdf_reader.pages:
-            text += page.extract_text() or ""
-
+    for doc in docs:
+        try:
+            if doc.name.lower().endswith(".pdf"):
+                pdf_reader = PdfReader(doc)
+                if getattr(pdf_reader, "is_encrypted", False):
+                    try:
+                        pdf_reader.decrypt("")
+                    except Exception:
+                        pass
+                for page in pdf_reader.pages:
+                    extracted = page.extract_text()
+                    if extracted:
+                        text += extracted + "\n"
+            elif doc.name.lower().endswith(".txt"):
+                text += doc.read().decode("utf-8", errors="ignore") + "\n"
+        except Exception as e:
+            st.error(f"Error reading {doc.name}: {e}")
     return text
+
+
+get_pdfs_text = get_documents_text
 
 
 def get_text_chunks(raw_text):
@@ -62,9 +97,10 @@ def get_session_history(session_id: str):
     return st.session_state.chat_store[session_id]
 
 
-def get_conversation_chain(vector_store):
+def get_conversation_chain(vector_store, api_key=None, model_name="openai/gpt-oss-20b"):
     llm = ChatGroq(
-        model_name="openai/gpt-oss-20b",
+        groq_api_key=api_key or os.getenv("GROQ_API_KEY"),
+        model_name=model_name,
         temperature=0.3
     )
 
@@ -178,23 +214,36 @@ def main():
         if st.session_state.conversation:
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    response = st.session_state.conversation.invoke(
-                        {"input": user_question},
-                        config={
-                            "configurable": {
-                                "session_id": "default_user"
+                    try:
+                        response = st.session_state.conversation.invoke(
+                            {"input": user_question},
+                            config={
+                                "configurable": {
+                                    "session_id": "default_user"
+                                }
                             }
-                        }
-                    )
+                        )
 
-                    answer = response["answer"]
+                        answer = response["answer"]
+                        st.markdown(answer)
 
-                    st.markdown(answer)
+                        if response.get("context"):
+                            with st.expander("🔍 View Retrieved Sources"):
+                                for i, doc in enumerate(response["context"], 1):
+                                    st.markdown(f"**Chunk {i}:**")
+                                    st.caption(doc.page_content)
 
-            st.session_state.messages.append({
-                "role": "assistant",
-                "content": answer
-            })
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": answer
+                        })
+                    except Exception as e:
+                        err_text = f"Groq API Error: {e}"
+                        st.error(err_text)
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": f"⚠️ {err_text}"
+                        })
 
         else:
             with st.chat_message("assistant"):
@@ -203,11 +252,35 @@ def main():
                 )
 
     with st.sidebar:
-        st.header("Documents")
+        st.header("⚙️ Configuration")
+        groq_api_key = st.text_input(
+            "Groq API Key",
+            value=os.getenv("GROQ_API_KEY", ""),
+            type="password",
+            help="Enter your Groq API key (or set GROQ_API_KEY in .env)"
+        )
 
-        pdf_docs = st.file_uploader(
-            "Upload your PDF documents",
-            type=["pdf"],
+        effective_key = groq_api_key.strip() or os.getenv("GROQ_API_KEY", "").strip()
+        available_models = get_available_groq_models(effective_key)
+        default_index = (
+            available_models.index("openai/gpt-oss-20b")
+            if "openai/gpt-oss-20b" in available_models
+            else 0
+        )
+
+        groq_model = st.selectbox(
+            "Groq Model",
+            options=available_models,
+            index=default_index,
+            help="Available models for your Groq account"
+        )
+
+        st.divider()
+        st.header("📄 Documents")
+
+        docs = st.file_uploader(
+            "Upload your documents (PDF, TXT)",
+            type=["pdf", "txt"],
             accept_multiple_files=True
         )
 
@@ -215,16 +288,29 @@ def main():
             "Process Documents",
             use_container_width=True
         ):
-            if not pdf_docs:
+            if not docs:
                 st.warning(
-                    "Please upload at least one PDF."
+                    "Please upload at least one PDF or TXT file."
+                )
+                return
+
+            effective_key = groq_api_key.strip() or os.getenv("GROQ_API_KEY", "").strip()
+            if not effective_key:
+                st.error(
+                    "Please enter a Groq API Key above or add it to your .env file."
                 )
                 return
 
             with st.spinner("Processing documents..."):
-                raw_text = get_pdfs_text(
-                    pdf_docs
+                raw_text = get_documents_text(
+                    docs
                 )
+
+                if not raw_text.strip():
+                    st.error(
+                        "No readable text could be extracted from the uploaded document(s). Please verify the file contents."
+                    )
+                    return
 
                 text_chunks = get_text_chunks(
                     raw_text
@@ -236,14 +322,16 @@ def main():
 
                 st.session_state.conversation = (
                     get_conversation_chain(
-                        vector_store
+                        vector_store,
+                        api_key=effective_key,
+                        model_name=groq_model
                     )
                 )
 
                 st.session_state.messages = []
 
                 st.success(
-                    "Documents processed successfully!"
+                    "Documents processed successfully! You can now ask questions."
                 )
 
 
